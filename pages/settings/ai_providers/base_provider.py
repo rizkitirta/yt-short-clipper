@@ -206,7 +206,16 @@ class BaseProviderSettingsPage(BaseSettingsSubPage):
     def validate_config(self):
         """Validate provider configuration"""
         api_key = self.key_entry.get().strip()
-        model = self.model_var.get().strip()
+        
+        # Determine model value based on mode
+        if self.USE_MANUAL_INPUT:
+            model = self.model_entry.get().strip()
+        else:
+            if self.model_var:
+                model = self.model_var.get().strip()
+            else:
+                model = ""
+        
         url = self.get_base_url()
         
         if not api_key:

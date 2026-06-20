@@ -71,8 +71,9 @@ class YTShortClipperApp(ctk.CTk):
         self.token_usage = {"gpt_input": 0, "gpt_output": 0, "whisper_seconds": 0, "tts_chars": 0}
         self.youtube_connected = False
         self.youtube_channel = None
-        self.ytdlp_path = get_ytdlp_path()  # NEW: Store yt-dlp path for subtitle fetching
-        self.cookies_path = COOKIES_FILE  # NEW: Store cookies path
+        self.ytdlp_path = get_ytdlp_path()  # Store yt-dlp path for subtitle fetching
+        self.cookies_path = COOKIES_FILE  # Store cookies path
+        self.local_video_path = None  # Path to a local video file (skip download if set)
         
         # Session data for highlight selection flow
         self.session_data = None  # Will store result from find_highlights_only
@@ -172,6 +173,14 @@ class YTShortClipperApp(ctk.CTk):
         # Clear URL input
         self.url_var.set("")
         
+        # Clear local video path
+        self.local_video_path = None
+        if hasattr(self, 'local_file_label'):
+            self.local_file_label.configure(text="")
+            self.local_file_label.pack_forget()
+        if hasattr(self, 'local_file_btn'):
+            self.local_file_btn.configure(text="📂 File Lokal")
+        
         # Reset thumbnail - recreate preview placeholder
         self.current_thumbnail = None
         self.create_preview_placeholder()
@@ -226,19 +235,29 @@ class YTShortClipperApp(ctk.CTk):
             anchor="w").pack(fill="x", pady=(0, 3))
         
         url_input_container = ctk.CTkFrame(left_col, fg_color="transparent")
-        url_input_container.pack(fill="x", pady=(0, 8))
+        url_input_container.pack(fill="x", pady=(0, 4))
         
         self.url_var = ctk.StringVar()
         self.url_var.trace_add("write", self.on_url_change)
         self.url_entry = ctk.CTkEntry(url_input_container, textvariable=self.url_var, 
-            placeholder_text="Paste YouTube link...", width=220, height=32, border_width=1,
+            placeholder_text="Paste YouTube link...", width=175, height=32, border_width=1,
             border_color=("#3a3a3a", "#2a2a2a"), fg_color=("#1a1a1a", "#0a0a0a"))
-        self.url_entry.pack(side="left", padx=(0, 5))
+        self.url_entry.pack(side="left", padx=(0, 4))
         
-        self.paste_btn = ctk.CTkButton(url_input_container, text="📋 Paste", width=65, height=32,
+        self.paste_btn = ctk.CTkButton(url_input_container, text="📋 Paste", width=60, height=32,
             fg_color=("#3a3a3a", "#2a2a2a"), hover_color=("#4a4a4a", "#3a3a3a"),
             font=ctk.CTkFont(size=10), command=self.paste_url)
-        self.paste_btn.pack(side="left")
+        self.paste_btn.pack(side="left", padx=(0, 4))
+        
+        self.local_file_btn = ctk.CTkButton(url_input_container, text="📂 File Lokal", width=75, height=32,
+            fg_color=("#2d4a2d", "#1a3a1a"), hover_color=("#3a5a3a", "#254a25"),
+            font=ctk.CTkFont(size=10), command=self.browse_local_file)
+        self.local_file_btn.pack(side="left")
+        
+        # Local file indicator (hidden by default)
+        self.local_file_label = ctk.CTkLabel(left_col, text="", font=ctk.CTkFont(size=9),
+            text_color=("#4ade80", "#4ade80"), anchor="w")
+        # Don't pack yet — will show when file is selected
         
         # Subtitle Language
         ctk.CTkLabel(left_col, text="Subtitle Language", font=ctk.CTkFont(size=11, weight="bold"), 
@@ -373,6 +392,88 @@ class YTShortClipperApp(ctk.CTk):
             debug_log(f"Paste error: {e}")
             # If clipboard is empty or error, do nothing
             pass
+    
+    def browse_local_file(self):
+        """Browse and select a local video file (skip download)"""
+        file_path = filedialog.askopenfilename(
+            title="Pilih file video yang sudah didownload",
+            filetypes=[
+                ("Video files", "*.mp4 *.mov *.mkv *.avi *.webm"),
+                ("MP4 files", "*.mp4"),
+                ("All files", "*.*")
+            ]
+        )
+        
+        if not file_path:
+            return
+        
+        self.local_video_path = file_path
+        file_name = Path(file_path).name
+        
+        # Truncate long filenames for display
+        display_name = file_name if len(file_name) <= 30 else file_name[:27] + "..."
+        
+        # Update button to show active state
+        self.local_file_btn.configure(
+            text="✅ File dipilih",
+            fg_color=("#1a4a1a", "#0d3a0d"),
+            hover_color=("#254a25", "#1a3a1a")
+        )
+        
+        # Show file name label
+        self.local_file_label.configure(text=f"📄 {display_name}")
+        self.local_file_label.pack(fill="x", pady=(0, 4))
+        
+        # Show thumbnail from local file
+        self._load_local_video_thumbnail(file_path)
+        
+        # Enable subtitle dropdown with "none" option for local files
+        self.subtitle_dropdown.configure(
+            state="normal",
+            values=["none - AI Transcription", "id - Indonesian", "en - English"]
+        )
+        self.subtitle_var.set("none - AI Transcription")
+        self.subtitle_loaded = True
+        
+        # Enable start button
+        self.update_start_button_state()
+        
+        debug_log(f"Local file selected: {file_path}")
+    
+    def _load_local_video_thumbnail(self, video_path: str):
+        """Load and display thumbnail from local video file"""
+        def extract():
+            try:
+                import cv2
+                cap = cv2.VideoCapture(video_path)
+                # Get frame from ~5% into the video
+                total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                target_frame = max(30, int(total_frames * 0.05))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                ret, img = cap.read()
+                cap.release()
+                
+                if ret:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    pil_img = Image.fromarray(img)
+                    pil_img.thumbnail((400, 225), Image.Resampling.LANCZOS)
+                    self.after(0, lambda: self._show_local_thumbnail(pil_img))
+            except Exception as e:
+                debug_log(f"Local thumbnail error: {e}")
+        
+        threading.Thread(target=extract, daemon=True).start()
+    
+    def _show_local_thumbnail(self, pil_img: Image.Image):
+        """Display local video thumbnail in preview frame"""
+        try:
+            for widget in self.thumb_frame.winfo_children():
+                widget.destroy()
+            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(400, 225))
+            self.current_thumbnail = ctk_img
+            label = ctk.CTkLabel(self.thumb_frame, image=ctk_img, text="")
+            label.place(relx=0.5, rely=0.5, anchor="center")
+        except Exception as e:
+            debug_log(f"Show local thumbnail error: {e}")
     
     def show_cookies_required_dialog(self):
         """Show custom dialog for cookies requirement with clickable buttons"""
@@ -701,17 +802,27 @@ class YTShortClipperApp(ctk.CTk):
             self.update_start_button_state()
     
     def update_start_button_state(self):
-        """Update start button state based on URL, cookies, and library validation"""
+        """Update start button state based on URL/local file, cookies, and library validation"""
         has_cookies = self.cookies_path.exists()
         libs_ok = getattr(self, 'libs_installed', True)  # Default True if not checked yet
+        has_local_file = bool(getattr(self, 'local_video_path', None))
         
         # Always keep paste button enabled (so user can see alert)
         self.paste_btn.configure(state="normal")
         
+        # Local file mode: bypass cookies requirement (no download needed)
+        if has_local_file and libs_ok:
+            self.url_entry.configure(state="normal")
+            self.start_btn.configure(state="normal", fg_color=("#1a5a1a", "#0d4a0d"),
+                                    hover_color=("#144a14", "#0a3a0a"),
+                                    text="▶ Proses File Lokal")
+            return
+        
         # If no cookies, disable URL entry and start button
         if not has_cookies:
             self.url_entry.configure(state="disabled")
-            self.start_btn.configure(state="disabled", fg_color="gray", hover_color="gray")
+            self.start_btn.configure(state="disabled", fg_color="gray", hover_color="gray",
+                                    text="Find Highlights")
             return
         
         # Cookies exist - enable URL input
@@ -723,9 +834,11 @@ class YTShortClipperApp(ctk.CTk):
         
         if video_id and self.subtitle_loaded and libs_ok:
             self.start_btn.configure(state="normal", fg_color=("#1f538d", "#14375e"), 
-                                    hover_color=("#144870", "#0d2a47"))
+                                    hover_color=("#144870", "#0d2a47"),
+                                    text="Find Highlights")
         else:
-            self.start_btn.configure(state="disabled", fg_color="gray", hover_color="gray")
+            self.start_btn.configure(state="disabled", fg_color="gray", hover_color="gray",
+                                    text="Find Highlights")
     
     def check_lib_status(self):
         """Check library installation status and update UI"""
@@ -1084,10 +1197,15 @@ class YTShortClipperApp(ctk.CTk):
             messagebox.showerror("Error", "Configure API settings first!\nClick ⚙️ button.")
             return
         
+        # Determine if we use local file or URL
+        local_path = getattr(self, 'local_video_path', None)
         url = self.url_var.get().strip()
-        if not extract_video_id(url):
-            messagebox.showerror("Error", "Enter a valid YouTube URL!")
-            return
+        
+        if not local_path:
+            if not extract_video_id(url):
+                messagebox.showerror("Error", "Enter a valid YouTube URL or select a local file!")
+                return
+        
         try:
             num_clips = int(self.clips_var.get())
             if not 1 <= num_clips <= 10:
@@ -1137,7 +1255,7 @@ class YTShortClipperApp(ctk.CTk):
         
         # NEW FLOW: Only find highlights (don't process yet)
         threading.Thread(target=self.run_find_highlights, 
-                        args=(url, num_clips, output_dir, model, subtitle_lang), 
+                        args=(url, num_clips, output_dir, model, subtitle_lang, local_path), 
                         daemon=True).start()
     
     def run_processing(self, url, num_clips, output_dir, model, add_captions, add_hook, subtitle_lang="id"):
@@ -1277,7 +1395,7 @@ class YTShortClipperApp(ctk.CTk):
         tts_chars = self.token_usage['tts_chars']
         self.pages["processing"].update_tokens(gpt_total, whisper_minutes, tts_chars)
     
-    def run_find_highlights(self, url, num_clips, output_dir, model, subtitle_lang="id"):
+    def run_find_highlights(self, url, num_clips, output_dir, model, subtitle_lang="id", local_video_path=None):
         """NEW: Phase 1 - Find highlights only (don't process yet)"""
         try:
             from clipper_core import AutoClipperCore, SubtitleNotFoundError
@@ -1312,7 +1430,7 @@ class YTShortClipperApp(ctk.CTk):
             
             try:
                 # Call find_highlights_only (returns session data)
-                result = core.find_highlights_only(url, num_clips)
+                result = core.find_highlights_only(url, num_clips, local_video_path=local_video_path)
             except SubtitleNotFoundError as snf:
                 # No subtitle found
                 if self.cancelled:

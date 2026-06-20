@@ -19,27 +19,30 @@ from openai import OpenAI
 from utils.logger import debug_log
 from utils.helpers import get_deno_path, get_ffmpeg_path, is_ytdlp_module_available
 
-# Setup Deno and FFmpeg in PATH before importing yt-dlp
-_deno_path = get_deno_path()
-_ffmpeg_path = get_ffmpeg_path()
+# Setup Deno and FFmpeg in PATH before importing yt-dlp (only if not in Docker)
+_in_docker = os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv')
 
-if _deno_path and Path(_deno_path).exists():
-    _deno_dir = str(Path(_deno_path).parent)
-    if "PATH" in os.environ:
-        if _deno_dir not in os.environ["PATH"]:
-            os.environ["PATH"] = f"{_deno_dir}{os.pathsep}{os.environ['PATH']}"
-    else:
-        os.environ["PATH"] = _deno_dir
-    debug_log(f"Deno added to PATH: {_deno_dir}")
+if not _in_docker:
+    _deno_path = get_deno_path()
+    _ffmpeg_path = get_ffmpeg_path()
+    
+    if _deno_path and Path(_deno_path).exists():
+        _deno_dir = str(Path(_deno_path).parent)
+        if "PATH" in os.environ:
+            if _deno_dir not in os.environ["PATH"]:
+                os.environ["PATH"] = f"{_deno_dir}{os.pathsep}{os.environ['PATH']}"
+        else:
+            os.environ["PATH"] = _deno_dir
+        debug_log(f"Deno added to PATH: {_deno_dir}")
 
-if _ffmpeg_path and Path(_ffmpeg_path).exists():
-    _ffmpeg_dir = str(Path(_ffmpeg_path).parent)
-    if "PATH" in os.environ:
-        if _ffmpeg_dir not in os.environ["PATH"]:
-            os.environ["PATH"] = f"{_ffmpeg_dir}{os.pathsep}{os.environ['PATH']}"
-    else:
-        os.environ["PATH"] = _ffmpeg_dir
-    debug_log(f"FFmpeg added to PATH: {_ffmpeg_dir}")
+    if _ffmpeg_path and Path(_ffmpeg_path).exists():
+        _ffmpeg_dir = str(Path(_ffmpeg_path).parent)
+        if "PATH" in os.environ:
+            if _ffmpeg_dir not in os.environ["PATH"]:
+                os.environ["PATH"] = f"{_ffmpeg_dir}{os.pathsep}{os.environ['PATH']}"
+        else:
+            os.environ["PATH"] = _ffmpeg_dir
+        debug_log(f"FFmpeg added to PATH: {_ffmpeg_dir}")
 
 # Import yt-dlp module if available
 try:
@@ -81,8 +84,8 @@ class AutoClipperCore:
         ffmpeg_path: str = "ffmpeg",
         ytdlp_path: str = "yt-dlp",
         output_dir: str = "output",
-        model: str = "gpt-4.1",
-        tts_model: str = "tts-1",
+        model: str = "gpt-5.2",
+        tts_model: str = "tts-1-hd",
         temperature: float = 1.0,
         system_prompt: str = None,
         watermark_settings: dict = None,
@@ -165,6 +168,7 @@ class AutoClipperCore:
         # MediaPipe Face Mesh (lazy loaded)
         self.mp_face_mesh = None
         self.mp_drawing = None
+        self.current_video_id = None
         
         # Create temp directory
         self.temp_dir = self.output_dir / "_temp"
@@ -246,6 +250,93 @@ class AutoClipperCore:
                 return f"fontfile='{font}':"
         # Fallback: let FFmpeg use fontconfig default
         return "font='Arial':"
+
+    def translate_to_english(self, text: str) -> str:
+        """Translate the given text to English using the highlight finder AI"""
+        # Resolve translation cache file path
+        video_id = self.current_video_id
+        cache_dir = None
+        cached_translations_path = None
+        translations_dict = {}
+        
+        if video_id:
+            try:
+                temp_path = Path(self.temp_dir).resolve()
+                parent2 = temp_path.parent.parent
+                if parent2.name.lower() == "desktop" or temp_path.parent.name.lower() != "temp":
+                    cache_dir = temp_path.parent / "downloads_cache"
+                else:
+                    cache_dir = parent2 / "downloads_cache"
+                
+                cached_translations_path = cache_dir / f"{video_id}_translations.json"
+                if cached_translations_path.exists():
+                    with open(cached_translations_path, "r", encoding="utf-8") as f:
+                        translations_dict = json.load(f)
+                    
+                    # Normalise space and case for lookup
+                    lookup_text = text.strip()
+                    if lookup_text in translations_dict:
+                        translation = translations_dict[lookup_text]
+                        self.log(f"  ✨ Cache Hit! Reusing translation: {translation}")
+                        return translation
+            except Exception as e:
+                self.log(f"  Warning: Failed to load translation cache: {e}")
+
+        try:
+            self.log(f"  AI translating hook to English: {text[:40]}...")
+            quote = text
+            if ":" in text:
+                parts = text.split(":", 1)
+                quote = parts[1].strip()
+            
+            prompt = f"Translate the following spoken quote to clean, casual English (suitable for TikTok subtitle). Respond ONLY with the translation, no explanation, no quotes:\n\n{quote}"
+            response = self.highlight_client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=50
+            )
+            translation = response.choices[0].message.content.strip()
+            translation = translation.strip('"').strip("'")
+            self.log(f"  ✓ Translation result: {translation}")
+            
+            # Save translation to cache if successful
+            if video_id and cached_translations_path:
+                try:
+                    translations_dict[text.strip()] = translation
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    with open(cached_translations_path, "w", encoding="utf-8") as f:
+                        json.dump(translations_dict, f, indent=2, ensure_ascii=False)
+                    self.log(f"  Saving translation to cache: {cached_translations_path}")
+                except Exception as e:
+                    self.log(f"  Warning: Failed to save translation to cache: {e}")
+            
+            return translation
+        except Exception as e:
+            self.log(f"  Warning: Translation to English failed: {e}")
+            return ""
+
+    def _get_youtube_id(self, url: str) -> str:
+        """Extract YouTube video ID or return a hash of the URL if it's not a standard YouTube URL"""
+        import re
+        import hashlib
+        
+        # Standard youtube URL regexes
+        patterns = [
+            r'(?:v=|\/v\/|embed\/|youtu\.be\/|\/shorts\/)([^?&#"\' >]+)',
+            r'youtube\.com/watch\?.*v=([^?&#"\']+)'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                video_id = match.group(1)
+                # Ensure it's a valid ID length (usually 11 chars)
+                if len(video_id) == 11:
+                    return video_id
+                    
+        # Fallback: hash the URL to generate a unique cache filename
+        return hashlib.md5(url.encode('utf-8')).hexdigest()
     
     @staticmethod
     def get_default_prompt():
@@ -450,11 +541,66 @@ Transcript:
             return
         
         if not srt_path:
-            raise SubtitleNotFoundError(
-                f"No subtitle available for language: {self.subtitle_language.upper()}",
-                video_path=video_path,
-                video_info=video_info
-            )
+            # Fallback: Check if Caption Maker (Whisper) is configured to transcribe the video
+            cm_config = self.ai_providers.get("caption_maker", {}) if self.ai_providers else {}
+            if cm_config.get("api_key"):
+                self.log(f"  ⚠ Subtitle not found for {self.subtitle_language.upper()}. Falling back to Whisper AI transcription...")
+                self.set_progress("Transcribing video with AI...", 0.2)
+                
+                try:
+                    transcript = self.transcribe_full_video(video_path)
+                    
+                    # Convert to standard SRT
+                    srt_lines = []
+                    lines = transcript.split('\n')
+                    counter = 1
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        match = re.match(r'^\[(\d{2}:\d{2}:\d{2},\d{3})\s*-\s*(\d{2}:\d{2}:\d{2},\d{3})\]\s*(.*)$', line)
+                        if match:
+                            start_ts, end_ts, text = match.groups()
+                            srt_lines.append(f"{counter}")
+                            srt_lines.append(f"{start_ts} --> {end_ts}")
+                            srt_lines.append(text)
+                            srt_lines.append("")
+                            counter += 1
+                    
+                    fallback_srt_path = self.temp_dir / f"source.{self.subtitle_language or 'en'}.srt"
+                    with open(fallback_srt_path, "w", encoding="utf-8") as f:
+                        f.write('\n'.join(srt_lines))
+                    
+                    srt_path = str(fallback_srt_path)
+                    self.log(f"  ✓ Created AI transcription subtitle file: {srt_path}")
+                    
+                    # Cache the generated SRT file
+                    if self.current_video_id:
+                        temp_path = Path(self.temp_dir).resolve()
+                        parent2 = temp_path.parent.parent
+                        if parent2.name.lower() == "desktop" or temp_path.parent.name.lower() != "temp":
+                            cache_dir = temp_path.parent / "downloads_cache"
+                        else:
+                            cache_dir = parent2 / "downloads_cache"
+                            
+                        lang = self.subtitle_language or "en"
+                        cached_srt_path = cache_dir / f"{self.current_video_id}.{lang}.srt"
+                        import shutil
+                        shutil.copy2(srt_path, cached_srt_path)
+                        self.log(f"  Saving AI transcription subtitle to cache: {cached_srt_path}")
+                except Exception as e:
+                    self.log(f"  Warning: Whisper fallback failed: {e}")
+                    raise SubtitleNotFoundError(
+                        f"No subtitle available and Whisper fallback failed: {e}",
+                        video_path=video_path,
+                        video_info=video_info
+                    )
+            else:
+                raise SubtitleNotFoundError(
+                    f"No subtitle available for language: {self.subtitle_language.upper()} and Caption Maker is not configured.",
+                    video_path=video_path,
+                    video_info=video_info
+                )
         
         # Step 2: Find highlights
         self.set_progress("Finding highlights...", 0.3)
@@ -485,13 +631,99 @@ Transcript:
         """Download video and subtitle with progress using yt-dlp module or executable"""
         self.log("[1/4] Downloading video & subtitle...")
         
+        # Get video ID
+        video_id = self._get_youtube_id(url)
+        self.current_video_id = video_id
+        
+        # Resolve cache directory:
+        # Default is to go up two levels to reach the data directory, e.g. data/temp/{job_id} -> data/downloads_cache
+        # But if going up two levels results in the user's Desktop directory, we fallback to a directory inside the workspace
+        # (e.g. workspace/_temp -> workspace/downloads_cache).
+        temp_path = Path(self.temp_dir).resolve()
+        parent2 = temp_path.parent.parent
+        
+        if parent2.name.lower() == "desktop" or temp_path.parent.name.lower() != "temp":
+            cache_dir = temp_path.parent / "downloads_cache"
+        else:
+            cache_dir = parent2 / "downloads_cache"
+            
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Check cache hit
+        cached_video_path = cache_dir / f"{video_id}.mp4"
+        if cached_video_path.exists() and os.path.getsize(cached_video_path) > 1000:
+            self.log(f"  ✨ Cache Hit! Reusing cached video: {cached_video_path}")
+            
+            # Subtitle check
+            srt_path = None
+            if self.subtitle_language and self.subtitle_language != "none":
+                cached_srt_path = cache_dir / f"{video_id}.{self.subtitle_language}.srt"
+                if cached_srt_path.exists():
+                    srt_path = str(cached_srt_path)
+                else:
+                    # Fallback to any other cached language subtitles
+                    available_subs = list(cache_dir.glob(f"{video_id}.*.srt"))
+                    if available_subs:
+                        srt_path = str(available_subs[0])
+                        detected_lang = Path(srt_path).name.split('.')[-2]
+                        self.log(f"  ⚠ {self.subtitle_language} subtitle not found in cache, using {detected_lang} instead")
+                    else:
+                        self.log(f"  ✗ No subtitles found in cache for {video_id}")
+            
+            # Load metadata JSON if exists
+            video_info = {}
+            cached_info_path = cache_dir / f"{video_id}_info.json"
+            if cached_info_path.exists():
+                try:
+                    with open(cached_info_path, "r", encoding="utf-8") as f:
+                        video_info = json.load(f)
+                    self.log(f"  ✓ Loaded cached video metadata: {video_info.get('title', '')[:50]}...")
+                except Exception as e:
+                    self.log(f"  Warning: Failed to load cached video metadata JSON: {e}")
+            
+            self.set_progress("Reusing cached video...", 0.25)
+            return str(cached_video_path), srt_path, video_info
+            
+        # Cache Miss: Download normally
+        self.log(f"  Cache Miss. Proceeding to download {url}")
+        
         # Check if using yt-dlp module
         use_module = YTDLP_MODULE_AVAILABLE and self.ytdlp_path == "yt_dlp_module"
         
         if use_module:
-            return self._download_video_module(url)
+            video_path, srt_path, video_info = self._download_video_module(url)
         else:
-            return self._download_video_subprocess(url)
+            video_path, srt_path, video_info = self._download_video_subprocess(url)
+            
+        # Cache the downloaded files
+        if video_path and os.path.exists(video_path) and os.path.getsize(video_path) > 1000:
+            try:
+                import shutil
+                self.log(f"  Saving video to cache: {cached_video_path}")
+                shutil.copy2(video_path, cached_video_path)
+                
+                # If subtitle exists, cache it too
+                if srt_path and os.path.exists(srt_path):
+                    srt_p = Path(srt_path)
+                    parts = srt_p.name.split('.')
+                    if len(parts) >= 3:
+                        lang = parts[-2]
+                    else:
+                        lang = self.subtitle_language or "unknown"
+                    cached_srt_path = cache_dir / f"{video_id}.{lang}.srt"
+                    self.log(f"  Saving subtitle to cache: {cached_srt_path}")
+                    shutil.copy2(srt_path, cached_srt_path)
+                
+                # Save metadata info to JSON
+                if video_info:
+                    cached_info_path = cache_dir / f"{video_id}_info.json"
+                    with open(cached_info_path, "w", encoding="utf-8") as f:
+                        json.dump(video_info, f, indent=2, ensure_ascii=False)
+                    self.log(f"  Saving video metadata to cache: {cached_info_path}")
+            except Exception as e:
+                self.log(f"  Warning: Failed to save download to cache: {e}")
+                
+        return video_path, srt_path, video_info
     
     def _download_video_module(self, url: str) -> tuple:
         """Download video using yt-dlp Python module API"""
@@ -734,6 +966,8 @@ Transcript:
                 help_text = help_result.stdout
                 if "--no-impersonate" in help_text:
                     base_args.append("--no-impersonate")
+                if "--remote-components" in help_text:
+                    base_args.extend(["--remote-components", "ejs:github"])
         except Exception:
             pass
         
@@ -768,7 +1002,39 @@ Transcript:
             self.log(f"  Downloading video (no subtitle, AI transcription mode)...")
         
         # Try multiple download strategies (fallback on failure)
-        download_strategies = [
+        download_strategies = []
+        
+        # Check if cookies.txt is available
+        cookies_candidates = [
+            Path("/Users/macbook/Desktop/yt-short-clipper/cookies.txt"),
+            Path("data/cookies.txt"),
+            Path("/app/data/cookies.txt"),
+            Path("cookies.txt")
+        ]
+        cookies_file = None
+        for path in cookies_candidates:
+            if path.exists():
+                if os.access(path, os.W_OK):
+                    cookies_file = path
+                    break
+                else:
+                    # Writable fallback: copy read-only file to writable temp dir
+                    try:
+                        temp_cookies = self.temp_dir / "cookies.txt"
+                        import shutil
+                        shutil.copy2(path, temp_cookies)
+                        cookies_file = temp_cookies
+                        break
+                    except Exception:
+                        pass
+                
+        if cookies_file:
+            download_strategies.append({
+                "name": "Cookies file (cookies.txt)",
+                "extra_args": ["--cookies", str(cookies_file)]
+            })
+            
+        download_strategies.extend([
             {
                 "name": "Browser cookies (Chrome)",
                 "extra_args": ["--cookies-from-browser", "chrome"]
@@ -781,7 +1047,7 @@ Transcript:
                 "name": "Simple format (no auth)",
                 "extra_args": []
             }
-        ]
+        ])
         
         # High-quality format selector (prioritize 720p+ with fallback)
         format_selector = "bestvideo[height>=720][height<=2160]+bestaudio/best[height>=720][height<=2160]/bestvideo+bestaudio/best"
@@ -1582,6 +1848,31 @@ Transcript:
         """Find highlights using GPT or Gemini"""
         self.log(f"[2/4] Finding highlights (using {self.model})...")
         
+        # Check highlights cache
+        video_id = self.current_video_id
+        cache_dir = None
+        if video_id:
+            temp_path = Path(self.temp_dir).resolve()
+            parent2 = temp_path.parent.parent
+            if parent2.name.lower() == "desktop" or temp_path.parent.name.lower() != "temp":
+                cache_dir = temp_path.parent / "downloads_cache"
+            else:
+                cache_dir = parent2 / "downloads_cache"
+            
+            cached_highlights_path = cache_dir / f"{video_id}_highlights_{num_clips}.json"
+            if cached_highlights_path.exists():
+                try:
+                    with open(cached_highlights_path, "r", encoding="utf-8") as f:
+                        cached_highlights = json.load(f)
+                    self.log(f"  ✨ Cache Hit! Reusing cached highlights: {cached_highlights_path}")
+                    for h in cached_highlights:
+                        duration = h.get("duration_seconds", 0.0)
+                        virality = h.get("virality_score", 5)
+                        self.log(f"  ✓ {h.get('title', 'Unknown')} ({duration:.0f}s) [🔥 {virality}/10]")
+                    return cached_highlights
+                except Exception as e:
+                    self.log(f"  Warning: Failed to load cached highlights: {e}")
+
         request_clips = num_clips + 3
         
         video_context = ""
@@ -1713,12 +2004,17 @@ Transcript:
             if len(valid) >= num_clips:
                 break
         
-        # If we don't have enough valid clips, warn user
-        if len(valid) < num_clips:
-            self.log(f"\n⚠️ WARNING: Only found {len(valid)} valid clips out of {num_clips} requested!")
-            self.log(f"   AI returned many segments that were too short (< 58s).")
-            self.log(f"   Consider using a better AI model or adjusting the prompt.")
-        
+        # Save highlights to cache if successful
+        if video_id and cache_dir and valid:
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                cached_highlights_path = cache_dir / f"{video_id}_highlights_{num_clips}.json"
+                with open(cached_highlights_path, "w", encoding="utf-8") as f:
+                    json.dump(valid[:num_clips], f, indent=2, ensure_ascii=False)
+                self.log(f"  Saving highlights to cache: {cached_highlights_path}")
+            except Exception as e:
+                self.log(f"  Warning: Failed to save highlights to cache: {e}")
+
         return valid[:num_clips]
     
     def process_clip(self, video_path: str, highlight: dict, index: int, total_clips: int = 1, add_captions: bool = True, add_hook: bool = True):
@@ -2016,32 +2312,63 @@ Transcript:
         # First pass: analyze frames
         crop_positions = []
         current_target = orig_w / 2
+        detect_scale = 0.25
+        frame_idx = 0
+        prev_gray = None
         
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
             
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(50, 50))
-            
-            if len(faces) > 0:
-                # Find largest face
-                largest = max(faces, key=lambda f: f[2] * f[3])
-                current_target = largest[0] + largest[2] / 2
+            # Detect faces every 5 frames to speed up processing
+            if frame_idx % 5 == 0:
+                # Resize frame to smaller size for faster detection (16x fewer pixels)
+                small_frame = cv2.resize(frame, (0, 0), fx=detect_scale, fy=detect_scale)
+                gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+                # Scale minSize proportionally
+                faces = face_cascade.detectMultiScale(gray, 1.1, 8, minSize=(24, 24))
+                
+                if len(faces) > 0:
+                    valid_faces = []
+                    if prev_gray is not None:
+                        diff = cv2.absdiff(gray, prev_gray)
+                        for face in faces:
+                            fx, fy, fw, fh = face
+                            face_diff = diff[fy:fy+fh, fx:fx+fw]
+                            motion_value = np.mean(face_diff) if face_diff.size > 0 else 0
+                            valid_faces.append((face, motion_value))
+                    else:
+                        for face in faces:
+                            valid_faces.append((face, 0))
+                    
+                    # Filter faces by motion (motion_threshold = 1.0)
+                    motion_threshold = 1.0
+                    moving_faces = [f for f, m in valid_faces if m >= motion_threshold]
+                    
+                    if moving_faces:
+                        largest = max(moving_faces, key=lambda f: f[2] * f[3])
+                    else:
+                        largest = max(faces, key=lambda f: f[2] * f[3])
+                        
+                    # Scale center X back to original size
+                    current_target = (largest[0] + largest[2] / 2) / detect_scale
+                
+                prev_gray = gray.copy()
             
             crop_x = int(current_target - crop_w / 2)
             crop_x = max(0, min(crop_x, orig_w - crop_w))
             crop_positions.append(crop_x)
+            frame_idx += 1
         
         # Stabilize positions
         crop_positions = self.stabilize_positions(crop_positions)
         
         # Second pass: create video
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
+        temp_video = tempfile.NamedTemporaryFile(suffix='.avi', delete=False).name
         
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
         out = cv2.VideoWriter(temp_video, fourcc, fps, (out_w, out_h))
         
         frame_idx = 0
@@ -2052,6 +2379,7 @@ Transcript:
             
             crop_x = crop_positions[frame_idx] if frame_idx < len(crop_positions) else crop_positions[-1]
             cropped = frame[0:crop_h, crop_x:crop_x+crop_w]
+            # Use INTER_LANCZOS4 for high quality upscaling
             resized = cv2.resize(cropped, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
             out.write(resized)
             frame_idx += 1
@@ -2174,12 +2502,13 @@ Transcript:
             static_image_mode=False,
             max_num_faces=3,
             refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7
         ) as face_mesh:
             
             frame_count = 0
             prev_lip_distances = {}  # Track previous lip distances per face
+            last_known_face_x = orig_w / 2
             
             while True:
                 if self.is_cancelled():
@@ -2194,7 +2523,7 @@ Transcript:
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = face_mesh.process(rgb_frame)
                 
-                best_face_x = orig_w / 2  # Default to center
+                best_face_x = last_known_face_x  # Use last known position instead of center
                 max_activity = 0
                 
                 if results.multi_face_landmarks:
@@ -2232,6 +2561,7 @@ Transcript:
                     if faces_data:
                         best_face = max(faces_data, key=lambda f: f['combined_score'])
                         best_face_x = best_face['x']
+                        last_known_face_x = best_face_x  # Update last known position
                         max_activity = best_face['activity']
                 
                 # Calculate crop position
@@ -2258,9 +2588,9 @@ Transcript:
         # Second pass: create video
         self.log("  Pass 2: Creating portrait video...")
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
+        temp_video = tempfile.NamedTemporaryFile(suffix='.avi', delete=False).name
         
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
         out = cv2.VideoWriter(temp_video, fourcc, fps, (out_w, out_h))
         
         if not out.isOpened():
@@ -2412,11 +2742,17 @@ Transcript:
         # Report TTS character usage
         self.report_tokens(0, 0, 0, len(hook_text))
         
+        # Generate TTS audio: strip speaker name (prefix before colon) if present to avoid mismatch
+        tts_input = hook_text
+        if ":" in hook_text:
+            parts = hook_text.split(":", 1)
+            tts_input = parts[1].strip()
+            
         # Generate TTS audio
         tts_response = self.tts_client.audio.speech.create(
             model=self.tts_model,
             voice="nova",
-            input=hook_text,
+            input=tts_input,
             speed=1.0
         )
         
@@ -2438,20 +2774,36 @@ Transcript:
         else:
             hook_duration = 3.0
         
-        # Format hook text: uppercase, split into lines (max 3 words per line for better visibility)
+        # Format hook text: Split speaker and quote if possible
         hook_upper = hook_text.upper()
-        words = hook_upper.split()
-        
-        # Split into lines (max 3 words per line - Fajar Sadboy style)
+        has_speaker = False
         lines = []
-        current_line = []
-        for word in words:
-            current_line.append(word)
-            if len(current_line) >= 3:
+        if ":" in hook_text:
+            parts = hook_upper.split(":", 1)
+            speaker = parts[0].strip() + ":"
+            content = parts[1].strip()
+            has_speaker = True
+            lines.append(speaker)
+            
+            content_words = content.split()
+            current_line = []
+            for word in content_words:
+                current_line.append(word)
+                if len(current_line) >= 3:
+                    lines.append(' '.join(current_line))
+                    current_line = []
+            if current_line:
                 lines.append(' '.join(current_line))
-                current_line = []
-        if current_line:
-            lines.append(' '.join(current_line))
+        else:
+            words = hook_upper.split()
+            current_line = []
+            for word in words:
+                current_line.append(word)
+                if len(current_line) >= 3:
+                    lines.append(' '.join(current_line))
+                    current_line = []
+            if current_line:
+                lines.append(' '.join(current_line))
         
         # Get input video info
         probe_cmd = [self.ffmpeg_path, "-i", input_path]
@@ -2472,7 +2824,7 @@ Transcript:
         hook_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
         
         # Build drawtext filter for each line
-        # Style: Yellow/gold text on white background box
+        # Style: Yellow/gold text on dark background box
         drawtext_filters = []
         line_height = 85  # pixels between lines
         font_size = 58
@@ -2484,16 +2836,19 @@ Transcript:
             escaped_line = line.replace("'", "'\\''").replace(":", "\\:").replace("\\", "\\\\")
             y_pos = start_y + (i * line_height)
             
+            # Gold for speaker name (line 0 if speaker prefix exists), else white
+            color = "#FFD700" if (has_speaker and i == 0) else "#FFFFFF"
+            
             # Yellow/gold text with white box background
             font_path = self._get_ffmpeg_font_path()
             drawtext_filters.append(
                 f"drawtext=text='{escaped_line}':"
                 f"{font_path}"
                 f"fontsize={font_size}:"
-                f"fontcolor=#FFD700:"  # Golden yellow
+                f"fontcolor={color}:"
                 f"box=1:"
-                f"boxcolor=white@0.95:"  # White background
-                f"boxborderw=12:"  # Padding around text
+                f"boxcolor=black@0.85:"  # Translucent black background
+                f"boxborderw=15:"  # Padding around text
                 f"x=(w-text_w)/2:"
                 f"y={y_pos}"
             )
@@ -2691,7 +3046,7 @@ Transcript:
                 transcript = self.caption_client.audio.transcriptions.create(
                     model=self.whisper_model,
                     file=f,
-                    language="id",
+                    language=self.subtitle_language if (self.subtitle_language and self.subtitle_language != "none") else None,
                     response_format="verbose_json",
                     timestamp_granularities=["word"]
                 )
@@ -2934,6 +3289,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         current_target = orig_w / 2
         frame_count = 0
         last_log_time = 0
+        detect_scale = 0.25
+        prev_gray = None
         import time
         
         while True:
@@ -2946,13 +3303,37 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             if not ret:
                 break
             
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(50, 50))
-            
-            if len(faces) > 0:
-                # Find largest face
-                largest = max(faces, key=lambda f: f[2] * f[3])
-                current_target = largest[0] + largest[2] / 2
+            # Detect faces every 5 frames
+            if frame_count % 5 == 0:
+                small_frame = cv2.resize(frame, (0, 0), fx=detect_scale, fy=detect_scale)
+                gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+                faces = face_cascade.detectMultiScale(gray, 1.1, 8, minSize=(24, 24))
+                
+                if len(faces) > 0:
+                    valid_faces = []
+                    if prev_gray is not None:
+                        diff = cv2.absdiff(gray, prev_gray)
+                        for face in faces:
+                            fx, fy, fw, fh = face
+                            face_diff = diff[fy:fy+fh, fx:fx+fw]
+                            motion_value = np.mean(face_diff) if face_diff.size > 0 else 0
+                            valid_faces.append((face, motion_value))
+                    else:
+                        for face in faces:
+                            valid_faces.append((face, 0))
+                    
+                    # Filter faces by motion (motion_threshold = 1.0)
+                    motion_threshold = 1.0
+                    moving_faces = [f for f, m in valid_faces if m >= motion_threshold]
+                    
+                    if moving_faces:
+                        largest = max(moving_faces, key=lambda f: f[2] * f[3])
+                    else:
+                        largest = max(faces, key=lambda f: f[2] * f[3])
+                        
+                    current_target = (largest[0] + largest[2] / 2) / detect_scale
+                
+                prev_gray = gray.copy()
             
             crop_x = int(current_target - crop_w / 2)
             crop_x = max(0, min(crop_x, orig_w - crop_w))
@@ -2980,9 +3361,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         sys.stdout.flush()  # Force output
         
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
+        temp_video = tempfile.NamedTemporaryFile(suffix='.avi', delete=False).name
         
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
         out = cv2.VideoWriter(temp_video, fourcc, fps, (out_w, out_h))
         
         if not out.isOpened():
@@ -3020,6 +3401,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             
             crop_x = crop_positions[frame_idx] if frame_idx < len(crop_positions) else crop_positions[-1]
             cropped = frame[0:crop_h, crop_x:crop_x+crop_w]
+            # Use INTER_LANCZOS4 for high quality upscaling
             resized = cv2.resize(cropped, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
             
             # Write frame with error checking
@@ -3156,11 +3538,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             static_image_mode=False,
             max_num_faces=3,
             refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7
         ) as face_mesh:
             
             prev_lip_distances = {}
+            last_known_face_x = orig_w / 2
             
             while True:
                 if self.is_cancelled():
@@ -3175,7 +3558,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = face_mesh.process(rgb_frame)
                 
-                best_face_x = orig_w / 2
+                best_face_x = last_known_face_x  # Use last known position instead of center
                 max_activity = 0
                 
                 if results.multi_face_landmarks:
@@ -3212,6 +3595,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     if faces_data:
                         best_face = max(faces_data, key=lambda f: f['combined_score'])
                         best_face_x = best_face['x']
+                        last_known_face_x = best_face_x  # Update last known position
                         max_activity = best_face['activity']
                 
                 crop_x = int(best_face_x - crop_w / 2)
@@ -3247,9 +3631,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         sys.stdout.flush()
         
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
+        temp_video = tempfile.NamedTemporaryFile(suffix='.avi', delete=False).name
         
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
         out = cv2.VideoWriter(temp_video, fourcc, fps, (out_w, out_h))
         
         if not out.isOpened():
@@ -3360,12 +3744,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         # Report TTS character usage
         self.report_tokens(0, 0, 0, len(hook_text))
         
+        # Generate TTS audio: strip speaker name (prefix before colon) if present to avoid mismatch
+        tts_input = hook_text
+        if ":" in hook_text:
+            parts = hook_text.split(":", 1)
+            tts_input = parts[1].strip()
+            
         # Generate TTS audio (10% progress)
         progress_callback(0.1)
         tts_response = self.tts_client.audio.speech.create(
             model=self.tts_model,
             voice="nova",
-            input=hook_text,
+            input=tts_input,
             speed=1.0
         )
         
@@ -3389,19 +3779,50 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         else:
             hook_duration = 3.0
         
-        # Format hook text
+        # Format hook text: Split speaker and quote if possible
         hook_upper = hook_text.upper()
-        words = hook_upper.split()
-        
+        has_speaker = False
         lines = []
-        current_line = []
-        for word in words:
-            current_line.append(word)
-            if len(current_line) >= 3:
+        if ":" in hook_text:
+            parts = hook_upper.split(":", 1)
+            speaker = parts[0].strip() + ":"
+            content = parts[1].strip()
+            has_speaker = True
+            lines.append(speaker)
+            
+            content_words = content.split()
+            current_line = []
+            for word in content_words:
+                current_line.append(word)
+                if len(current_line) >= 3:
+                    lines.append(' '.join(current_line))
+                    current_line = []
+            if current_line:
                 lines.append(' '.join(current_line))
-                current_line = []
-        if current_line:
-            lines.append(' '.join(current_line))
+        else:
+            words = hook_upper.split()
+            current_line = []
+            for word in words:
+                current_line.append(word)
+                if len(current_line) >= 3:
+                    lines.append(' '.join(current_line))
+                    current_line = []
+            if current_line:
+                lines.append(' '.join(current_line))
+                
+        # English translation subtitles
+        en_translation = self.translate_to_english(hook_text)
+        en_lines = []
+        if en_translation:
+            en_words = en_translation.split()
+            current_line = []
+            for word in en_words:
+                current_line.append(word)
+                if len(current_line) >= 5: # 5 words per line is good for smaller font
+                    en_lines.append(' '.join(current_line))
+                    current_line = []
+            if current_line:
+                en_lines.append(' '.join(current_line))
         
         # Get input video info
         probe_cmd = [self.ffmpeg_path, "-i", input_path]
@@ -3418,23 +3839,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         
         progress_callback(0.3)
         
-        # Create hook video in our temp directory
-        hook_video = str(self.temp_dir / f"hook_{int(time.time() * 1000)}.mp4")
-        
-        # Create text file for drawtext filter (avoid escaping issues)
-        text_file = str(self.temp_dir / f"hook_text_{int(time.time() * 1000)}.txt")
-        
-        # Write text lines to file
-        text_content = '\n'.join(lines)
-        with open(text_file, 'w', encoding='utf-8') as f:
-            f.write(text_content)
-        
-        # Use a simpler approach: create static image with text, then combine with audio
-        # This avoids complex FFmpeg filter escaping issues
-        
-        # First, create a simple background video from first frame using GPU/CPU encoder
+        # Create background video from first frame
         bg_video = str(self.temp_dir / f"hook_bg_{int(time.time() * 1000)}.mp4")
-        
         encoder_args = self.get_video_encoder_args()
         bg_cmd = [
             self.ffmpeg_path, "-y",
@@ -3454,108 +3860,137 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if result.returncode != 0:
             self.log(f"Failed to create background video: {result.stderr}")
             raise Exception("Failed to create background video")
-        
-        # Verify background video was created successfully
+            
+        # Verify background video
         if not os.path.exists(bg_video) or os.path.getsize(bg_video) < 1000:
             raise Exception("Background video was not created properly")
+            
+        # Define text_file as None to satisfy cleanup dependencies
+        text_file = None
+            
+        # Setup coordinates and unified bounding box
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        id_scale = 1.8
+        id_thickness = 4
+        en_scale = 1.1
+        en_thickness = 2
         
-        # Copy font to temp dir to avoid path issues in FFmpeg filter
-        import shutil
-        temp_font = str(self.temp_dir / "arial_bold.ttf")
-        if not os.path.exists(temp_font):
-            font_src = self._find_system_font_bold()
-            if font_src:
-                shutil.copy(font_src, temp_font)
+        block_gap = 35
         
-        # Now add text overlays one by one
-        current_video = bg_video
-        line_height = 85
-        font_size = 58
-        total_text_height = len(lines) * line_height
-        start_y = (height // 3) - (total_text_height // 2)
+        id_heights = []
+        id_widths = []
+        for line in lines:
+            (w, h), b = cv2.getTextSize(line, font, id_scale, id_thickness)
+            id_heights.append(h + b)
+            id_widths.append(w)
+            
+        en_heights = []
+        en_widths = []
+        for line in en_lines:
+            (w, h), b = cv2.getTextSize(line, font, en_scale, en_thickness)
+            en_heights.append(h + b)
+            en_widths.append(w)
+            
+        total_id_height = sum(id_heights) + (len(lines) - 1) * 20 if lines else 0
+        total_en_height = sum(en_heights) + (len(en_lines) - 1) * 12 if en_lines else 0
         
-        for i, line in enumerate(lines):
-            # Normalize unicode characters
-            normalized_line = line.encode('ascii', 'ignore').decode('ascii')
-            if not normalized_line.strip():
-                normalized_line = line.replace('\u2026', '...').replace('\u2013', '-').replace('\u2018', "'").replace('\u2019', "'").replace('\u201c', '"').replace('\u201d', '"')
+        total_height = total_id_height
+        if en_lines:
+            total_height += block_gap + total_en_height
             
-            y_pos = start_y + (i * line_height)
+        start_y = (height // 3) - (total_height // 2)
+        
+        max_text_width = 0
+        current_y = start_y
+        draw_lines = []
+        
+        # ID lines
+        for idx, line in enumerate(lines):
+            (w, h), b = cv2.getTextSize(line, font, id_scale, id_thickness)
+            max_text_width = max(max_text_width, w)
+            tx = (width - w) // 2
+            ty = current_y + h
             
-            next_video = str(self.temp_dir / f"hook_text_{int(time.time() * 1000)}_{i}.mp4")
+            color = (0, 215, 255) if (has_speaker and idx == 0) else (255, 255, 255)
+            draw_lines.append({
+                "text": line,
+                "x": tx,
+                "y": ty,
+                "color": color,
+                "scale": id_scale,
+                "thickness": id_thickness,
+                "height": h,
+                "baseline": b
+            })
+            current_y += h + b + 20
             
-            # Use OpenCV to add text overlay instead of FFmpeg drawtext
-            # This avoids all Windows path escaping issues
-            self.log(f"Adding text overlay with OpenCV: {normalized_line}")
-            
-            # Read input video
-            cap = cv2.VideoCapture(current_video)
-            fps = int(cap.get(cv2.CAP_PROP_FPS))
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            
-            # Setup video writer
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(next_video, fourcc, fps, (width, height))
-            
-            # Process each frame
-            frame_count = 0
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+        if en_lines:
+            current_y += block_gap
+            for idx, line in enumerate(en_lines):
+                (w, h), b = cv2.getTextSize(line, font, en_scale, en_thickness)
+                max_text_width = max(max_text_width, w)
+                tx = (width - w) // 2
+                ty = current_y + h
                 
-                # Add text overlay using cv2.putText
-                # Calculate text size for centering
-                font = cv2.FONT_HERSHEY_SIMPLEX  # Fixed: use SIMPLEX instead of BOLD
-                font_scale = 2.0
-                thickness = 4
+                draw_lines.append({
+                    "text": line,
+                    "x": tx,
+                    "y": ty,
+                    "color": (200, 200, 200),
+                    "scale": en_scale,
+                    "thickness": en_thickness,
+                    "height": h,
+                    "baseline": b
+                })
+                current_y += h + b + 12
                 
-                # Get text size
-                (text_width, text_height), baseline = cv2.getTextSize(
-                    normalized_line, font, font_scale, thickness
-                )
+        # Card bounding box with padding
+        padding_x = 35
+        padding_y = 35
+        box_x1 = max(0, ((width - max_text_width) // 2) - padding_x)
+        box_y1 = max(0, start_y - padding_y)
+        box_x2 = min(width, box_x1 + max_text_width + (2 * padding_x))
+        box_y2 = min(height, box_y1 + total_height + (2 * padding_y))
+        
+        # Setup intermediate video output
+        next_video = str(self.temp_dir / f"hook_text_{int(time.time() * 1000)}.avi")
+        self.log(f"Drawing unified card overlays with OpenCV in single pass")
+        
+        cap = cv2.VideoCapture(bg_video)
+        out = cv2.VideoWriter(next_video, cv2.VideoWriter_fourcc(*'MJPG'), fps, (width, height))
+        
+        frame_count = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
                 
-                # Calculate position (centered horizontally, at y_pos vertically)
-                text_x = (width - text_width) // 2
-                text_y = y_pos + text_height
-                
-                # Draw white background box
-                box_padding = 12
-                box_x1 = text_x - box_padding
-                box_y1 = text_y - text_height - box_padding
-                box_x2 = text_x + text_width + box_padding
-                box_y2 = text_y + baseline + box_padding
-                
-                # Draw semi-transparent white box
-                overlay = frame.copy()
-                cv2.rectangle(overlay, (box_x1, box_y1), (box_x2, box_y2), (255, 255, 255), -1)
-                cv2.addWeighted(overlay, 0.95, frame, 0.05, 0, frame)
-                
-                # Draw yellow/gold text (#FFD700 = RGB(255, 215, 0))
-                cv2.putText(frame, normalized_line, (text_x, text_y),
-                           font, font_scale, (0, 215, 255), thickness, cv2.LINE_AA)
-                
-                out.write(frame)
-                frame_count += 1
+            overlay = frame.copy()
+            box_color = (20, 20, 20)      # BGR Dark Charcoal
+            border_color = (80, 80, 80)    # BGR Gray Border
             
-            cap.release()
-            out.release()
+            # Draw unified card background and borders
+            cv2.rectangle(overlay, (box_x1, box_y1), (box_x2, box_y2), box_color, -1)
+            cv2.rectangle(overlay, (box_x1, box_y1), (box_x2, box_y2), border_color, 2, cv2.LINE_AA)
+            cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
             
-            self.log(f"Processed {frame_count} frames with text overlay")
+            # Draw all text lines
+            for dl in draw_lines:
+                normalized_line = dl["text"].encode('ascii', 'ignore').decode('ascii')
+                cv2.putText(frame, normalized_line, (dl["x"], dl["y"]),
+                            font, dl["scale"], dl["color"], dl["thickness"], cv2.LINE_AA)
+                            
+            out.write(frame)
+            frame_count += 1
             
-            # Verify output was created
-            if not os.path.exists(next_video) or os.path.getsize(next_video) < 1000:
-                raise Exception(f"Text overlay video {i} was not created properly")
+        cap.release()
+        out.release()
+        
+        self.log(f"Processed {frame_count} frames with unified card text overlay")
+        if not os.path.exists(next_video) or os.path.getsize(next_video) < 1000:
+            raise Exception("Unified card text overlay video was not created properly")
             
-            # Clean up previous temp file
-            if current_video != bg_video:
-                try:
-                    os.unlink(current_video)
-                except:
-                    pass
-            
-            current_video = next_video
+        current_video = next_video
         
         # Re-encode OpenCV output to proper H.264 before adding audio using GPU/CPU encoder
         # OpenCV mp4v codec is not compatible with copy codec
@@ -3576,6 +4011,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             raise Exception("Failed to re-encode text overlay video")
         
         # Finally, add audio to re-encoded video
+        hook_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
         cmd = [
             self.ffmpeg_path, "-y",
             "-i", reencoded_video,
@@ -3740,7 +4176,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 transcript = self.caption_client.audio.transcriptions.create(
                     model=self.whisper_model,
                     file=f,
-                    language="id",
+                    language=self.subtitle_language if (self.subtitle_language and self.subtitle_language != "none") else None,
                     response_format="verbose_json",
                     timestamp_granularities=["word"]
                 )
@@ -3899,7 +4335,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         progress_callback(0.2)
         
         # Get credit watermark settings
-        size = self.credit_watermark_settings.get("size", 0.03)
+        size = self.credit_watermark_settings.get("size", 0.018)  # Reduced from 0.03 to 0.018 for a minimalist elegant fit
         pos_x = self.credit_watermark_settings.get("position_x", 0.5)
         pos_y = self.credit_watermark_settings.get("position_y", 0.95)
         opacity = self.credit_watermark_settings.get("opacity", 0.7)
@@ -3941,8 +4377,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 f"fontcolor=white@{opacity}:"
                 f"borderw=2:"
                 f"bordercolor=black@{opacity}:"
-                f"x={x_pixels}-(text_w/2):"
-                f"y={y_pixels}-(text_h/2)"
+                f"x='clip({x_pixels}-(text_w/2), 20, w-text_w-20)':"
+                f"y='clip({y_pixels}-(text_h/2), 20, h-text_h-20)'"
             )
         else:
             # Fallback without fontfile (may cause fontconfig warning but should still work)
@@ -3952,8 +4388,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 f"fontcolor=white@{opacity}:"
                 f"borderw=2:"
                 f"bordercolor=black@{opacity}:"
-                f"x={x_pixels}-(text_w/2):"
-                f"y={y_pixels}-(text_h/2)"
+                f"x='clip({x_pixels}-(text_w/2), 20, w-text_w-20)':"
+                f"y='clip({y_pixels}-(text_h/2), 20, h-text_h-20)'"
             )
         
         progress_callback(0.3)
@@ -3987,19 +4423,20 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if not Path(output_path).exists():
             raise Exception("Failed to apply credit watermark")
 
-    def find_highlights_only(self, url: str, num_clips: int = 5) -> dict:
+    def find_highlights_only(self, url: str, num_clips: int = 5, local_video_path: str = None) -> dict:
         """Phase 1: Download video and find highlights (without processing)
         
+        Args:
+            url: YouTube URL
+            num_clips: Number of highlights to find
+            local_video_path: Path to a local video file (if provided, skip download)
+            
         Returns:
-            dict with keys:
-                - 'session_dir': Path to session directory
-                - 'video_path': Path to downloaded video
-                - 'srt_path': Path to subtitle file
-                - 'highlights': List of highlight dicts with metadata
-                - 'video_info': Video metadata (title, channel, etc.)
+            dict with session data
         """
         # Create session directory with timestamp
         from datetime import datetime
+        import shutil
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         session_dir = self.output_dir / "sessions" / timestamp
         session_dir.mkdir(parents=True, exist_ok=True)
@@ -4010,9 +4447,52 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         
         self.log(f"Session directory: {session_dir}")
         
-        # Step 1: Download video
-        self.set_progress("Downloading video...", 0.1)
-        video_path, srt_path, video_info = self.download_video(url)
+        video_path = None
+        srt_path = None
+        video_info = None
+        
+        if local_video_path and Path(local_video_path).exists():
+            self.log(f"Using local video file: {local_video_path}")
+            self.set_progress("Preparing local video...", 0.1)
+            
+            import hashlib
+            self.current_video_id = f"local_{hashlib.md5(str(local_video_path).encode('utf-8')).hexdigest()}"
+            
+            # Use local file name as title
+            local_path = Path(local_video_path)
+            title = local_path.stem
+            
+            # Copy to temp as source.ext
+            ext = local_path.suffix.lower() or ".mp4"
+            target_path = self.temp_dir / f"source{ext}"
+            shutil.copy2(local_video_path, target_path)
+            video_path = str(target_path)
+            
+            # Create dummy video info
+            video_info = {
+                "title": title,
+                "id": f"local_{timestamp}",
+                "channel": "Local File",
+                "duration": 0, # Will be filled later if needed
+                "webpage_url": f"file://{local_video_path}"
+            }
+            
+            # Try to get real duration using ffprobe
+            try:
+                from utils.helpers import get_ffmpeg_path
+                ffprobe_path = str(Path(get_ffmpeg_path()).parent / "ffprobe")
+                cmd = [ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", video_path]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    video_info["duration"] = float(result.stdout.strip())
+            except:
+                pass
+                
+            self.log(f"Local video prepared: {video_path}")
+        else:
+            # Step 1: Download video
+            self.set_progress("Downloading video...", 0.1)
+            video_path, srt_path, video_info = self.download_video(url)
         
         # Store channel name for credit watermark
         self.channel_name = video_info.get("channel", "") if video_info else ""
